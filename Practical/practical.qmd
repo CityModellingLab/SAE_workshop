@@ -30,7 +30,7 @@ Please, make sure you have `R version 4.5.1 (2025-06-13)` installed in your lapt
 required_packages <- c(
   "sae", "emdi", "saeTrafo", "hbsae", "SUMMER", "survey",
   "dplyr", "tidyr", "purrr", "sf", 
-  "ggplot2", "hrbrthemes", "GGally", "patchwork"
+  "ggplot2", "hrbrthemes", "GGally", "patchwork", "plotly"
 )
 
 to_install <- setdiff(required_packages, rownames(installed.packages()))
@@ -60,6 +60,7 @@ library(GGally)       # For visualisations
 library(patchwork)    # For visualisations
 library(viridis)      # For visualisations
 library(cowplot)      # For visualisations
+library(plotly)       # For interactive visualisations
 ```
 
 # Introduction
@@ -113,31 +114,26 @@ smp_district_summary <- eusilcA_smp %>%
 shape_district_summary <- shape_austria_dis %>%
   left_join(smp_district_summary, by = c("PB" = "district"))
 
-# Map
-ggplot() +
-  geom_sf(data = shape_district_summary, aes(fill = n), col = NA) +
+# Interactive map
+p <- ggplot() +
+  geom_sf(
+    data = shape_district_summary,
+    aes(fill = n, text = paste("District:", PB, "<br>Sample Size:", n)),
+    col = NA
+  ) +
   scale_fill_viridis_c(option = "D", direction = 1) +
   labs(
     title = "Number of Observations per District",
     fill = "Sample Size"
   ) +
   theme_void()
+
+ggplotly(p, tooltip = "text")
 ```
 
-We see that the observations are unequally distributed across the different districts. We see higher sample sizes in larger cities, specially in Vienna, the capital and most populous city in the country. Furthermore, we have 24 districts that are not represented in the sample:
+We see that the observations are unequally distributed across the different districts. We see higher sample sizes in larger cities, specially in Vienna, the capital and most populous city in the country. Furthermore, we have 24 districts that are not represented in the sample. This will sigificantly affect the results of our estimators, since, as we learnt in the theoertical bit of the workshop, some methods only generate outputs for areas with sampled observations.
 
-```{r}
-# Check if all districts in the population are in the sample
-table(eusilcA_popAgg$Domain %in% unique(eusilcA_smp$district))
-
-# View all districts in the sample
-t <- as.data.frame(unique(eusilcA_smp$district))
-t
-```
-
-This is a relevant fact, since it will significantly affect the results and even the implementation of some SAE methods --remember that direct methods only generate outputs for areas with sampled observations.
-
-Our target variable `eqIncome` follows a skewed distribution, with majority of individuals concentrated around lower income values (€ 20,000). We see very high agreement between sample values and population values.
+We can further explore what our data looks like. Our target variable `eqIncome` follows a skewed distribution, with majority of individuals concentrated around lower income values (€ 20,000). We see very high agreement between sample values and population values.
 
 ```{r, echo = FALSE}
 ggplot() +
