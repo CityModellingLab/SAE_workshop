@@ -152,7 +152,7 @@ ggplot() +
 
 Now that we have a better understanding of the data, we can start calculating our estimators.
 
-# Direct estimatorr
+# Direct estimator
 
 We will start by computing the most simple SAE estimator -- the direct estimator. Direct estimators use only information collected from the domain of interest. They are relatively simple to obtain, since they use the sample weights and population values. However, they are very sensitive to small sample sizes.
 
