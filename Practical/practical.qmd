@@ -1,0 +1,299 @@
+---
+title: "Mapping the Unseen: Small Area Estimation for Urban Analysis"
+author:
+  - name: Clara Peiret-García
+    email: c.peiret-garcia@ucl.ac.uk
+    affiliations:
+      - name: Centre for Advanced Spatial Analysis, UCL
+  - name: Anna Freni Sterrantino
+    affiliations:
+      - name: Alan Turing Institute | Imperial College London
+  - name: Esra Suel
+    affiliations:
+      - name: Centre for Advanced Spatial Analysis, UCL
+      
+  - name: Adam Dennett
+    affiliations:
+      - name: Centre for Advanced Spatial Analysis, UCL
+  - name: Gerard Casey
+    affiliations:
+      - name: Arup | Centre for Advanced Spatial Analysis, UCL
+      
+format: html
+editor: visual
+---
+
+Please, make sure you have `R version 4.5.1 (2025-06-13)` installed in your laptop. You can download it from here: <https://cran.r-project.org/>
+
+```{r, message=FALSE}
+# Install required packages if not already installed
+required_packages <- c(
+  "sae", "emdi", "saeTrafo", "hbsae", "SUMMER", "survey",
+  "dplyr", "tidyr", "purrr", "sf", 
+  "ggplot2", "hrbrthemes", "GGally", "patchwork"
+)
+
+to_install <- setdiff(required_packages, rownames(installed.packages()))
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+# Install INLA for Bayesian SAE estimators
+if (!isTRUE(requireNamespace("INLA", quietly = TRUE))) {
+  install.packages("INLA", repos=c(getOption("repos"), 
+                  INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+}
+
+library(sae)          # Small area estimation models
+library(emdi)         # Example datasets
+library(saeTrafo)     # For domain sizes
+library(SUMMER)       # Bayesian SAE
+library(survey)       # Survey designs
+
+library(dplyr)        # For data wrangling
+library(tidyr)        # For data wrangling
+library(purrr)        # For data wrangling
+library(sf)           # For mapping
+library(ggplot2)      # For visualisations
+library(hrbrthemes)   # For visualisations
+library(GGally)       # For visualisations
+library(patchwork)    # For visualisations
+library(viridis)      # For visualisations
+library(cowplot)      # For visualisations
+```
+
+# Introduction
+
+In this practical we will put into practice the concepts we learnt on the theoretical session of the workshop. Using survey data, we will calculate direct and model-based income estimators. We will explore the different alternatives available when implementing these methods, which will help us choose the most adequate option given data availability. To better understand the implications of using different models, we will compare the results of the estimates generated through different methods. You can access the `.qmd` document for this practical from [this link](https://github.com/cpeiretgarcia/SAE_workshop_CUPUM/blob/main/practical.qmd).
+
+# Data
+
+For this workshop we will be using the European Union Statistics on Income and Living Conditions (EU-SILC). Specifically, we will be using the Austrian EU-SILC data sets available through the `emdi` package. EU-SILC provides detailed information on attributes related to income, material deprivation, labour, housing, childcare, health, access to and use of services, and education.
+
+From the package `emdi` we can load a set of data related to the EU-SILC survey. `eusilcA_smp` is the random independent sample, where each row represents one individual, and each column represents a unit-level attribute. In total, the sample comprises 1,945 individuals. `eusilcA_popAgg` comprises the area-level covariates for all domains[^1]. `eusilcA_pop` is the total population -- it comprises 25,000 observations which we will assume add up to the total population of Austria for this example. Finally, `eusilcA_prox` is the adjacency matrix for every district in Austria.
+
+[^1]: Remember that a domain refers to a small geographic area or a subpopulation (e.g., age group or income class) for which we want to calculate the small area estimation.
+
+```{r}
+# Load data
+data("eusilcA_smp")     # Random independent Sample
+data("eusilcA_popAgg")  # Aggregated covariates at district level
+data("eusilcA_pop")     # Population level data
+data("eusilcA_prox")    # Adjacency matrix
+data("eusilcA_smpAgg")  # Aggregated sample data
+
+# Recode the domain variable as character
+eusilcA_smp$district <- droplevels(eusilcA_smp$district)
+eusilcA_smp$district <- as.character(eusilcA_smp$district)
+```
+
+Let us start by having a look at the sample data `eusilcA_smp`. Each row in the sample represents one individual, and for each of them we have information on a wide range of economic and demographic attributes. In this practical, our **target variable** will be the the equivalised household income (`eqIncome`), which represents the household income adjusted by household composition characteristics.
+
+```{r}
+head(eusilcA_smp)
+```
+
+We can also have a look at the spatial distribution of the observations in the sample.
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+# Load geospatial data and set CRS
+load_shapeaustria()
+shape_austria_dis <- st_set_crs(shape_austria_dis, 4326) # Set CRS
+
+# Calculate the number of observations per district in the sample
+smp_district_summary <- eusilcA_smp %>%
+  group_by(district) %>%
+  summarise(
+    n = n(),  # Count of observations
+    across(where(is.numeric), mean, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Join the summarised sample to the district boundary data and leave NAs
+shape_district_summary <- shape_austria_dis %>%
+  left_join(smp_district_summary, by = c("PB" = "district"))
+
+# Map
+ggplot() +
+  geom_sf(data = shape_district_summary, aes(fill = n), col = NA) +
+  scale_fill_viridis_c(option = "D", direction = 1) +
+  labs(
+    title = "Number of Observations per District",
+    fill = "Sample Size"
+  ) +
+  theme_void()
+```
+
+We see that the observations are unequally distributed across the different districts. We see higher sample sizes in larger cities, specially in Vienna, the capital and most populous city in the country. Furthermore, we have 24 districts that are not represented in the sample:
+
+```{r}
+# Check if all districts in the population are in the sample
+table(eusilcA_popAgg$Domain %in% unique(eusilcA_smp$district))
+
+# View all districts in the sample
+t <- as.data.frame(unique(eusilcA_smp$district))
+t
+```
+
+This is a relevant fact, since it will significantly affect the results and even the implementation of some SAE methods --remember that direct methods only generate outputs for areas with sampled observations.
+
+Our target variable `eqIncome` follows a skewed distribution, with majority of individuals concentrated around lower income values (€ 20,000). We see very high agreement between sample values and population values.
+
+```{r, echo = FALSE}
+ggplot() +
+  geom_histogram(data = eusilcA_pop, aes(x = eqIncome, fill = "Population"), 
+                 position = "identity", alpha = 0.5, bins = 50, color = "white") +
+  geom_histogram(data = eusilcA_smp, aes(x = eqIncome, fill = "Sample"), 
+                 position = "identity", alpha = 0.5, bins = 50, color = "white") +
+  scale_fill_manual(name = "", values = c("Population" = "#ca6702", "Sample" = "#69b3a2")) +
+  labs(
+    title = "Equivalised Income Distribution",
+    x = "eqIncome",
+    y = "Count"
+  ) +
+    theme_minimal()
+```
+
+Now that we have a better understanding of the data, we can start calculating our estimators.
+
+# Direct estimator
+
+We will start by computing the most simple SAE estimator -- the direct estimator. Direct estimators use only information collected from the domain of interest. They are relatively simple to obtain, since they use the sample weights and population values. However, they are very sensitive to small sample sizes.
+
+To demonstrate how the direct estimator works, we will first compute it manually but following the Horvitz-Thompson estimator of domain means and its formula:
+
+$$
+\hat{\bar{Y_d}} = \frac{1}{N_d} \sum_{i \in s_d} w_{di}Y_{di}
+$$
+
+where $N_d$ is the population at the domain of interest $d$; $s_d$ is the set of sampled observations in domain $d$; $w_{di}$ is the sample weight for unit $i$ in domain $d$; and $Y_{di}$ is the observation of the target variable for unit $i$ in domain $d$, for all $i$ in $S_d$.
+
+Before we manually calculate the direct estimator, we will have a closer look at the sampling weights ($w_{di}$). These values represent the survey weigths, and we can find them in the `weights` column of our sample data set `eusilcA_smp`. In our survey, the weights are calculated as the inverse probabilities of selection or, in other words, the inverse of the likelyhood of an individual of the population being sampled. The value indicates the number of survey respondents in the population. This information can usually be found in the documentation of the survey, together with any clusters or strata that might have been defined by the surveyors.
+
+These *design weights* can be calculated following this formula:
+
+$$
+weight_i = \frac{N_d}{n_d}
+$$
+
+To manually calculate the weights, we can do the following:
+
+```{r}
+# Check that each district has different weights assigned
+# Count number of times each weigth repeats itself in the sample (in total we should get 70 rows)
+weights_per_district <- eusilcA_smp |> 
+  select(district, weight) |> 
+  distinct()
+nrow(weights_per_district)
+
+# Calculate the weights manually
+## Count population per district
+pop_count <- eusilcA_pop |>
+  count(district, name = "N_d")
+
+## Count sample per district
+smp_count <- eusilcA_smp |>
+  count(district, name = "n_d")
+
+## Merge and calculate weight
+weight_check <- left_join(smp_count, pop_count, by = "district") |>
+  mutate(calculated_weight = N_d / n_d)
+
+## Add weights from sample and check they are the same
+weight_check |> 
+  left_join(weights_per_district, by = "district") |> 
+  mutate(weights_diff = calculated_weight - weight)
+```
+
+The `weights_diff` column is the difference between our manually calculated weights (`calculated_weight`) and the survey weights (`weight`). We can see that the values are either zero or very close to zero (this minimal difference is due to rounding differences), which proves that the weights in the survey were calculated as the inverse probability of selection.
+
+Let us now calculate the direct estimator manually:
+
+```{r}
+# Calculate total population values for sampled domains
+N <- pop_count |> filter(pop_count$district %in% eusilcA_smp$district)
+
+# Add N to the sample data
+dir_df <- eusilcA_smp |> 
+  left_join(N, by = "district") |> 
+  dplyr::select(district, eqIncome, weight, N_d)
+
+# Calculate direct estimator manually for each domain
+manual_direct <- dir_df |> 
+  mutate(w_Y = weight * eqIncome) |> 
+  group_by(district, N_d) |> 
+  summarise(sum_wY = sum(w_Y, na.rm = TRUE), .groups = "drop") |> 
+  mutate(dir_est_manual = sum_wY / N_d)
+
+# See results
+head(manual_direct)
+```
+
+Now, we will calculate the direct estimator using the `sae` package. The `direct()` function computes the Horvitz-Thompson estimator, the same one we have just manually computed. In addition to the direct estimator of the mean, the `direct()` function also gives us the standard deviation and coefficient of variation for each domain.
+
+```{r}
+# Calculate the direct estimator manually
+sae_direct <- sae::direct(
+  y = eusilcA_smp$eqIncome,        # Individual values of the target variable
+  dom = eusilcA_smp$district,      # Domain names
+  sweight = eusilcA_smp$weight,    # Sampling weights
+  domsize = N,                     # Data frame with domain names and the corresponding population sizes.
+  replace = FALSE                  # Sampling conducted without replacement
+)
+
+# See results
+head(sae_direct)
+```
+
+Once we have calculated the direct estimator manually and using the pre-defined `direct()` function of the `sae` package, we can compare the results
+
+```{r}
+# Join both into a single data frame
+direct_compare <- left_join(
+  x = sae_direct[,c("Domain", "Direct")],
+  y = manual_direct[,c("district", "dir_est_manual")],
+  by = c("Domain" = "district")
+)
+
+# Compare values
+ggplot(data = direct_compare) +
+  geom_point(aes(x = Direct, y = dir_est_manual)) +
+  labs(
+    title = "`sae` direct estimator vs manual direct estimator",
+    x = "`sae` direct estimator",
+    y = "Manual direct estimator"
+    ) +
+  theme_minimal()
+```
+
+The plot shows a perfect match between the manually computed direct estimator values and the values from the `direct()` function of the `sae` package. Now that we have tested how the `sae` function works under the hood, we can plot our results.
+
+```{r, fig.height=10}
+# Add confidence intervals
+sae_direct_ci <- sae_direct |> 
+  mutate(
+    lower = Direct - 1.96 * SD,
+    upper = Direct + 1.96 * SD
+  )
+
+# Plot
+ggplot(sae_direct_ci, aes(x = reorder(Domain, Direct), y = Direct)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), colour = "gray", width = 0.3) +
+  geom_point(color = "#264653") +
+  coord_flip() +
+  labs(
+    x = "District",
+    y = "Equivalised income (Direct Estimate)",
+    title = "Direct Estimates of Equivalised Income (95% CI)"
+  ) +
+  theme_minimal() +
+  theme(
+  axis.text.y = element_text(lineheight = 1.5)  # Default is 1, try 1.3–2
+)
+```
+
+The plot shows the value of the direct estimator and the confidence interval around that value. The confidence interval is calculated as the mean plus and minus the standard deviation multiplied by a constant value (1.96) that comes from the standard normal distribution at a 95% confidence interval. The interval represents all the possible \`\`true values'' of our estimator. Longer error bars indicate higher uncertainty around the values --there is a larger range of potential true values-- while shorter error bars indicate lower uncertainty --the range of potential values is more constrained.
+
+The advantage of using the `sae` package is that it allows us to easily implement variations of the direct estimate calculation. In some cases, the survey might have been conducted following different surveying strategies in a more flexible way. For instance, it might be that the sampling was conducted with replacement, instead of without replacement \[\^2\], or it could be that we do not have access to the domain of interest population sizes, in which case we would have to proceed differently to calculate our direct es
+
+\[\^2\] Survey sampling --selecting individuals from the total population for a survey-- can be done with or without replacement. Sampling without replacement means that individuals from a domain can only be sampled once (imagine we take a ball out of a bag and we do not put it back); or with replacement (we take a ball out of the bag and put it back).
