@@ -196,9 +196,18 @@ weight_check <- left_join(smp_count, pop_count, by = "district") |>
   mutate(calculated_weight = N_d / n_d)
 
 ## Add weights from sample and check they are the same
-weight_check |> 
-  left_join(weights_per_district, by = "district") |> 
-  mutate(weights_diff = calculated_weight - weight)
+weight_check <- weight_check |> 
+  left_join(weights_per_district, by = "district")
+
+## Plot to check if they are the same
+ggplot() +
+  geom_point(data = weight_check, aes(x = calculated_weight, y = weight)) +
+  labs(
+    title = "Calculated Weights vs Survey Weights",
+    x = "Calculated Weights",
+    y = "Survey Weights"
+  ) +
+  theme_minimal()
 ```
 
 The `weights_diff` column is the difference between our manually calculated weights (`calculated_weight`) and the survey weights (`weight`). We can see that the values are either zero or very close to zero (this minimal difference is due to rounding differences), which proves that the weights in the survey were calculated as the inverse probability of selection.
@@ -293,3 +302,86 @@ The plot shows the value of the direct estimator and the confidence interval aro
 The advantage of using the `sae` package is that it allows us to easily implement variations of the direct estimate calculation. In some cases, the survey might have been conducted following different surveying strategies in a more flexible way. For instance, it might be that the sampling was conducted with replacement, instead of without replacement \[\^2\], or it could be that we do not have access to the domain of interest population sizes, in which case we would have to proceed differently to calculate our direct es
 
 \[\^2\] Survey sampling --selecting individuals from the total population for a survey-- can be done with or without replacement. Sampling without replacement means that individuals from a domain can only be sampled once (imagine we take a ball out of a bag and we do not put it back); or with replacement (we take a ball out of the bag and put it back).
+
+# Model-based estimator
+
+Direct estimators can lead to unreliable estimates, especially in areas for which we have very few observations in the sample. 
+
+Model-based estimators incorporate auxiliary information from the full population, available through census data and other aggregated data sources. They are more robust to small sample sizes, since they can borrow strength from other domains. However, they require a model to be fitted to the data, which can be more complex than the direct estimator, and the results can be more difficult to interpret.
+
+### The Fay-Herriot Model and Our Austria Example
+
+The core idea of the Fay-Herriot model is to combine the unreliable direct estimator (the sampling model) with a more stable, model-based estimate (the linking model).
+
+**1. The Sampling Model (Revisited with the example)**
+
+$$\hat{\theta}_i^{\mathrm{DIR}} = \theta_i + \epsilon_i$$
+
+-   $\hat{\theta}_i^{\mathrm{DIR}}$: Our direct estimate of average income for district $i$ (e.g., €56,667 for Murau, calculated from the small sample).
+-   $\theta_i$: The true, but unknown, average income for district $i$.
+-   $\epsilon_i$: The sampling error, which is large for districts with small samples (like Murau) and small for districts with large samples (like Wien). The variance of this error, $V_i$, is known from our survey design.
+
+### 2. The Linking Model: The "Secret Sauce"
+
+This is where we "borrow strength" from other areas and auxiliary data. The linking model assumes that the **true average income** ($\theta_i$) for a district is not completely random but is related to other known characteristics of that district.
+
+$$\theta_i = x_i' \beta + u_i$$
+
+-   $\theta_i$: The true average income for district $i$ (e.g., Murau). We're trying to model this value.
+
+-   $x_i' \beta$: This is the **model-based part**. It's a linear regression that predicts the average income based on known, reliable data for each district. These are our "auxiliary variables" ($x_i$).
+
+    -   $x_i$: A vector of auxiliary variables for district $i$. For our Austrian example, these could be:
+        -   The average education level of the district.
+        -   The average age of the population.
+        -   The unemployment rate from a separate census-like source.
+        -   The proportion of the population working in specific industries (e.g., agriculture vs. manufacturing).
+    -   $\beta$: A vector of regression coefficients. These are unknown parameters that the model estimates from the data. They tell us how much each auxiliary variable affects the average income across all districts. For example, a positive $\beta$ for "average education level" would mean that districts with higher education tend to have higher average incomes.
+
+-   $u_i$: This is the **area-specific random effect**. This is a very important part of the model.
+
+    -   It represents the part of the true average income ($\theta_i$) that **cannot be explained** by the auxiliary variables ($x_i$). It's the unique, un-modeled characteristic of district $i$.
+    -   For Murau, even after accounting for its demographics and industries, there might be unique local factors that make its true average income higher or lower than what the model predicts. The random effect $u_{\text{Murau}}$ captures this unique difference.
+    -   The model assumes these effects are normally distributed with a mean of zero and a common variance $\sigma_u^2$. This means that on average, the auxiliary variables do a good job of predicting the income, but there is always some random, unique variation from district to district.
+
+### The Error Terms: $\epsilon_i$ vs. $u_i$
+
+This is a critical distinction in the Fay-Herriot model.
+
+-   $\epsilon_i$ (Sampling Error): This is the error in our **measurement**. It's the random variability that comes from our survey's sampling process. This error is specific to the direct estimator.
+    -   **Example:** The error in our Murau direct estimate is huge because of the tiny sample. The variance $V_{\text{Murau}}$ is large.
+-   $u_i$ (Area-Specific Random Effect): This is the error in our **linking model**. It's the random variability that comes from our regression model not perfectly explaining the true income. This error is specific to the underlying true value $\theta_i$.
+    -   **Example:** Even if we had a perfect census for all districts, a simple regression model wouldn't perfectly predict every district's average income. The random effect $u_i$ accounts for that inherent, unmodeled variability.
+
+### The Advanced Error Term: Spatial Correlation
+
+The final part of your description introduces a more advanced version of the linking model, which addresses a key limitation of the basic model.
+
+$$u = \rho_1 Wu + \epsilon$$
+
+-   **Basic Assumption:** The standard Fay-Herriot model assumes that the unique effects ($u_i$) for each district are **independent**. This means that a high true income in one district (after accounting for the auxiliary variables) tells us nothing about the true income in a neighboring district. This assumption is often wrong.
+
+-   **The Reality:** In our Austria example, it's very likely that a district's true average income is correlated with its neighbors' incomes. If a district has a higher-than-expected income, its neighboring districts are also likely to have higher-than-expected incomes due to shared economic factors, commuter patterns, or other regional influences. This is called **spatial correlation**.
+
+-   **The Advanced Model:** The equation you provided is a way to model this spatial correlation.
+
+    -   $W$: This is an **adjacency matrix**. It's a mathematical representation of which districts are neighbors. For example, if Wien and Graz are neighbors, the matrix would have a 1 in the corresponding cell; otherwise, it would have a 0.
+    -   $\rho_1$: This is a spatial **autoregression parameter**. It's a single value between -1 and 1 that tells us the strength of the spatial correlation.
+        -   If $\rho_1$ is positive, it means that districts with a high random effect tend to be next to other districts with high random effects.
+        -   If $\rho_1$ is close to 0, there is no spatial correlation, and the model simplifies to the basic Fay-Herriot model.
+    -   **The new error term:** The new error term, $\epsilon$, is now assumed to be independent and identically distributed, and it is part of this new equation for $u$.
+
+**In summary:** The linking model provides a way to estimate the true average income for each district by combining a regression model with auxiliary variables and a unique, random effect. The advanced version of this model acknowledges and quantifies the spatial correlation between neighboring districts, which often provides a more accurate and robust estimate, especially for areas with very small sample sizes.
+
+Intercept only model
+
+This is an excellent description of the simplest form of the Fay-Herriot model. It helps us understand the fundamental principle of "borrowing strength" without the added complexity of auxiliary variables. Let's break down the intercept-only model using our Austrian districts and income example.
+
+### The Intercept-Only Model in Simple Terms
+
+The intercept-only model is the most basic way to improve a direct estimator. It essentially says:
+
+-   "We don't have any specific data (like demographics or education) to predict a district's income."
+-   "Therefore, our best guess for any district's true income is the **overall average income for all of Austria**."
+-   "However, we know that each district will have its own unique, random deviation from this average."
+-   "We will combine this overall average with our direct estimate from the survey, giving more weight to the overall average when the direct estimate is unreliable (i.e., has a high variance)."
